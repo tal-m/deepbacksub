@@ -60,6 +60,33 @@ cv::Mat getTensorMat(int tnum, int debug) {
 // deeplabv3 classes
 std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
 
+// threaded capture shared state
+typedef struct {
+	cv::VideoCapture *cap;
+	cv::Mat *grab;
+	cv::Mat *raw;
+	int64 cnt;
+	pthread_mutex_t lock;
+} capinfo_t;
+
+// capture thread function
+void *grab_thread(void *arg) {
+	capinfo_t *ci = (capinfo_t *)arg;
+	bool done = false;
+	// while we have a grab frame.. grab frames
+	while (!done) {
+		ci->cap->grab();
+		pthread_mutex_lock(&ci->lock);
+		if (ci->grab!=NULL)
+			ci->cap->retrieve(*ci->grab);
+		else
+			done = true;
+		ci->cnt++;
+		pthread_mutex_unlock(&ci->lock);
+	}
+	return NULL;
+}
+
 int main(int argc, char* argv[]) {
 
 	printf("deepseg v0.1.0\n");
@@ -168,18 +195,38 @@ int main(int argc, char* argv[]) {
 	const int cnum = labels.size();
 	const int pers = std::find(labels.begin(),labels.end(),"person") - labels.begin();
 
+	// kick off separate grabber thread to keep OpenCV/FFMpeg happy (or it lags badly)
+	pthread_t grabber;
+	cv::Mat buf1;
+	cv::Mat buf2;
+	capinfo_t capinfo = { &cap, &buf1, &buf2, 0, PTHREAD_MUTEX_INITIALIZER };
+	if (pthread_create(&grabber, NULL, grab_thread, &capinfo)) {
+		perror("creating grabber thread");
+		exit(1);
+	}
+	// wait for first frame
+	while (0==capinfo.cnt)
+		usleep(1000);
+
 	// stats
 	int64 es = cv::getTickCount();
 	int64 e1 = es;
 	int64 fr = 0;
 	while (true) {
 
-		// grab frame from camera
-		cv::Mat raw;
-		cap >> raw;
+		// switch buffer pointers in capture thread
+		pthread_mutex_lock(&capinfo.lock);
+		cv::Mat *tmat = capinfo.grab;
+		capinfo.grab = capinfo.raw;
+		capinfo.raw = tmat;
+		pthread_mutex_unlock(&capinfo.lock);
+		// we can now guarantee capinfo.raw will remain unchanged while we process it..
+		cv::Mat raw = (*capinfo.raw);
 		// resize to output if required
 		if (capw != width || caph != height)
 			cv::resize(raw,raw,cv::Size(width,height));
+
+		// map ROI
 		cv::Mat roi = raw(roidim);
 		// convert BGR to RGB, resize ROI to input size
 		cv::Mat in_u8_rgb, in_resized;
@@ -241,13 +288,16 @@ int main(int argc, char* argv[]) {
 		float el = (e2-e1)/cv::getTickFrequency();
 		float t = (e2-es)/cv::getTickFrequency();
 		e1 = e2;
-		printf("\relapsed:%0.3f fr=%ld fps:%3.1f   ", el, fr, fr/t);
+		printf("\relapsed:%0.3f gr=%ld fr=%ld fps:%3.1f   ", el, capinfo.cnt, fr, fr/t);
 		fflush(stdout);
 		if (debug > 1) {
 			cv::imshow("Deepseg:output",raw);
 			if (cv::waitKey(1) == 'q') break;
 		}
 	}
+	pthread_mutex_lock(&capinfo.lock);
+	capinfo.grab = NULL;
+	pthread_mutex_unlock(&capinfo.lock);
 
 	return 0;
 }
