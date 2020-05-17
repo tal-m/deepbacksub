@@ -186,7 +186,7 @@ int main(int argc, char* argv[]) {
 
 	// initialize mask and square ROI in center
 	cv::Rect roidim = cv::Rect((width-height)/2,0,height,height);
-	cv::Mat mask = cv::Mat::ones(height,width,CV_8UC1);
+	cv::Mat mask = cv::Mat::zeros(height,width,CV_32FC1);
 	cv::Mat mroi = mask(roidim);
 
 	// erosion/dilation element
@@ -237,18 +237,13 @@ int main(int argc, char* argv[]) {
 		// convert to float and normalize values to [-1;1]
 		in_resized.convertTo(input,CV_32FC3,1.0/128.0,-1.0);
 
-		if (debug>1) {
-			cv::imshow("Deepseg:input", in_resized);
-			if (cv::waitKey(1) == 'q') break;
-		}
-
 		// Run inference
 		TFLITE_MINIMAL_CHECK(interpreter->Invoke() == kTfLiteOk);
 
 		// create Mat for small mask
-		cv::Mat ofinal(output.rows,output.cols,CV_8UC1);
+		cv::Mat ofinal(output.rows,output.cols,CV_32FC1);
 		float* tmp = (float*)output.data;
-		uint8_t* out = (uint8_t*)ofinal.data;
+		float* out = (float*)ofinal.data;
 
 		// find class with maximum probability
 		for (unsigned int n = 0; n < output.total(); n++) {
@@ -259,20 +254,33 @@ int main(int argc, char* argv[]) {
 					maxpos = i;
 				}
 			}
-			// set mask to 0 where class == person
-			out[n] = (maxpos==pers ? 0 : 255);
+			// set mask to 1.0 where class == person
+			out[n] = (maxpos==pers ? 1.0 : 0);
 		}
 
 		// denoise
 		cv::Mat tmpbuf;
 		cv::dilate(ofinal,tmpbuf,element);
 		cv::erode(tmpbuf,ofinal,element);
-
+		// smooth mask edges
+		cv::blur(ofinal,tmpbuf,cv::Size(5,5));
 		// scale up into full-sized mask
-		cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
-
-		// copy background over raw cam image using mask
-		bg.copyTo(raw,mask);
+		cv::resize(tmpbuf,mroi,cv::Size(mroi.cols,mroi.rows));
+		// alpha blend raw and background images using mask, adapted from:
+		// https://www.learnopencv.com/alpha-blending-using-opencv-cpp-python/
+		uint8_t *rptr = (uint8_t*)raw.data;
+		uint8_t *bptr = (uint8_t*)bg.data;
+		float   *aptr = (float*)mask.data;
+		int npix = raw.rows * raw.cols;
+		for (int pix=0; pix<npix; ++pix) {
+			// blending weights
+			float rw=*aptr, bw=1.0-rw;
+			// blend each channel byte
+			*rptr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr;
+			*rptr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr;
+			*rptr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr;
+			++aptr;
+		}
 
 		// write frame to v4l2loopback
 		cv::Mat yuv;
