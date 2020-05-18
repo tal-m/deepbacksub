@@ -23,9 +23,9 @@ limitations under the License.
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/types_c.h>
-#include <opencv2/videoio/videoio_c.h>
 
 #include "loopback.h"
+#include "capture.h"
 
 // Tensorflow Lite helper functions
 using namespace tflite;
@@ -59,33 +59,6 @@ cv::Mat getTensorMat(int tnum, int debug) {
 
 // deeplabv3 classes
 std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
-
-// threaded capture shared state
-typedef struct {
-	cv::VideoCapture *cap;
-	cv::Mat *grab;
-	cv::Mat *raw;
-	int64 cnt;
-	pthread_mutex_t lock;
-} capinfo_t;
-
-// capture thread function
-void *grab_thread(void *arg) {
-	capinfo_t *ci = (capinfo_t *)arg;
-	bool done = false;
-	// while we have a grab frame.. grab frames
-	while (!done) {
-		ci->cap->grab();
-		pthread_mutex_lock(&ci->lock);
-		if (ci->grab!=NULL)
-			ci->cap->retrieve(*ci->grab);
-		else
-			done = true;
-		ci->cnt++;
-		pthread_mutex_unlock(&ci->lock);
-	}
-	return NULL;
-}
 
 int main(int argc, char* argv[]) {
 
@@ -131,34 +104,33 @@ int main(int argc, char* argv[]) {
 	printf("back:   %s\n", back);
 	printf("threads:%d\n", threads);
 
-	// read background into raw BGR24 format, resize to output
-	cv::Mat bg = cv::imread(back);
-	cv::resize(bg,bg,cv::Size(width,height));
-	// open loopback virtual camera stream, assumes YUV420p output
+	// open loopback virtual camera stream, always with YUV420p output
 	int lbfd = loopback_init(vcam,width,height,debug);
-
-	// check for local device name and ensure using V4L2, set capture props,
-	// otherwise assume URL and allow OpenCV to choose the right backend,
-	// finally, always enable RGB (actually BGR24) conversion so we have sane input
-	// https://github.com/opencv/opencv/blob/master/modules/videoio/src/cap_v4l.cpp#1525
-	cv::VideoCapture cap;
-	int capw, caph;
-	if (strncmp(ccam, "/dev/video", 10)==0) {
-		cap.open(ccam, CV_CAP_V4L2);
-		cap.set(CV_CAP_PROP_FRAME_WIDTH,  capw=width);
-		cap.set(CV_CAP_PROP_FRAME_HEIGHT, caph=height);
-		// don't care now we are forcing RGB out of capture
-		//cap.set(CV_CAP_PROP_FOURCC, *((uint32_t*)"YUYV"));
-		cap.set(CV_CAP_PROP_CONVERT_RGB, true);
+	// open capture device stream, pass in/out expected/actual size
+	int capw = width, caph = height;
+	capinfo_t *pcap = capture_init(ccam, &capw, &caph, debug);
+	TFLITE_MINIMAL_CHECK(pcap!=NULL);
+	printf("stream info:\n");
+	printf("  width:  %d\n", capw);
+	printf("  height: %d\n", caph);
+	printf("  rate:   %d\n", pcap->rate);
+	// check background file extension (yeah, I know) to spot videos..
+	cv::Mat bg;
+	capinfo_t *pbkg = NULL;
+	int bkgw = width, bkgh = height;
+	char *dot = rindex((char*)back, '.');
+	if (dot!=NULL &&
+		(strcasecmp(dot, ".png")==0 ||
+		 strcasecmp(dot, ".jpg")==0 ||
+		 strcasecmp(dot, ".jpeg")==0)) {
+		// read background into raw BGR24 format, resize to output
+		bg = cv::imread(back);
+		cv::resize(bg,bg,cv::Size(width,height));
 	} else {
-		cap.open(ccam);
-		cap.set(CV_CAP_PROP_CONVERT_RGB, true);
-		printf("stream info:\n");
-		printf("  width:  %d\n", capw=(int)cap.get(CV_CAP_PROP_FRAME_WIDTH));
-		printf("  height: %d\n", caph=(int)cap.get(CV_CAP_PROP_FRAME_HEIGHT));
+		// assume video background..
+		pbkg = capture_init(back, &bkgw, &bkgh, debug);
+		TFLITE_MINIMAL_CHECK(pbkg!=NULL);
 	}
-	TFLITE_MINIMAL_CHECK(cap.isOpened());
-
 
 	// Load model
 	std::unique_ptr<tflite::FlatBufferModel> model =
@@ -189,24 +161,13 @@ int main(int argc, char* argv[]) {
 	cv::Mat mask = cv::Mat::zeros(height,width,CV_32FC1);
 	cv::Mat mroi = mask(roidim);
 
-	// erosion/dilation element
-	cv::Mat element = cv::getStructuringElement( cv::MORPH_RECT, cv::Size(5,5) );
+	// erosion/dilation elements
+	cv::Mat element3 = cv::getStructuringElement( cv::MORPH_ELLIPSE, cv::Size(3,3) );
+	cv::Mat element7 = cv::getStructuringElement( cv::MORPH_ELLIPSE, cv::Size(7,7) );
+	cv::Mat element11 = cv::getStructuringElement( cv::MORPH_ELLIPSE, cv::Size(11,11) );
 
 	const int cnum = labels.size();
 	const int pers = std::find(labels.begin(),labels.end(),"person") - labels.begin();
-
-	// kick off separate grabber thread to keep OpenCV/FFMpeg happy (or it lags badly)
-	pthread_t grabber;
-	cv::Mat buf1;
-	cv::Mat buf2;
-	capinfo_t capinfo = { &cap, &buf1, &buf2, 0, PTHREAD_MUTEX_INITIALIZER };
-	if (pthread_create(&grabber, NULL, grab_thread, &capinfo)) {
-		perror("creating grabber thread");
-		exit(1);
-	}
-	// wait for first frame
-	while (0==capinfo.cnt)
-		usleep(1000);
 
 	// stats
 	int64 es = cv::getTickCount();
@@ -214,14 +175,16 @@ int main(int argc, char* argv[]) {
 	int64 fr = 0;
 	while (true) {
 
-		// switch buffer pointers in capture thread
-		pthread_mutex_lock(&capinfo.lock);
-		cv::Mat *tmat = capinfo.grab;
-		capinfo.grab = capinfo.raw;
-		capinfo.raw = tmat;
-		pthread_mutex_unlock(&capinfo.lock);
-		// we can now guarantee capinfo.raw will remain unchanged while we process it..
-		cv::Mat raw = (*capinfo.raw);
+		// grab next available background frame (if video)
+		if (pbkg!=NULL) {
+			bg = *(capture_frame(pbkg));
+			// resize to output if required
+			if (bkgw != width || bkgh != height)
+				cv::resize(bg,bg,cv::Size(width,height));
+		}
+
+		// grab next available video frame
+		cv::Mat raw = *(capture_frame(pcap));
 		// resize to output if required
 		if (capw != width || caph != height)
 			cv::resize(raw,raw,cv::Size(width,height));
@@ -258,14 +221,20 @@ int main(int argc, char* argv[]) {
 			out[n] = (maxpos==pers ? 1.0 : 0);
 		}
 
-		// denoise
-		cv::Mat tmpbuf;
-		cv::dilate(ofinal,tmpbuf,element);
-		cv::erode(tmpbuf,ofinal,element);
+		// denoise, close & open with small then large elements, adapted from:
+		// https://stackoverflow.com/questions/42065405/remove-noise-from-threshold-image-opencv-python
+		if (getenv("DEEPSEG_NODENOISE")==NULL) {
+			cv::morphologyEx(ofinal,ofinal,CV_MOP_CLOSE,element3);
+			cv::morphologyEx(ofinal,ofinal,CV_MOP_OPEN,element3);
+			cv::morphologyEx(ofinal,ofinal,CV_MOP_CLOSE,element7);
+			cv::morphologyEx(ofinal,ofinal,CV_MOP_OPEN,element7);
+			cv::dilate(ofinal,ofinal,element11);
+		}
 		// smooth mask edges
-		cv::blur(ofinal,tmpbuf,cv::Size(5,5));
+		if (getenv("DEEPSEG_NOBLUR")==NULL)
+			cv::blur(ofinal,ofinal,cv::Size(7,7));
 		// scale up into full-sized mask
-		cv::resize(tmpbuf,mroi,cv::Size(mroi.cols,mroi.rows));
+		cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
 		// alpha blend raw and background images using mask, adapted from:
 		// https://www.learnopencv.com/alpha-blending-using-opencv-cpp-python/
 		uint8_t *rptr = (uint8_t*)raw.data;
@@ -296,16 +265,17 @@ int main(int argc, char* argv[]) {
 		float el = (e2-e1)/cv::getTickFrequency();
 		float t = (e2-es)/cv::getTickFrequency();
 		e1 = e2;
-		printf("\relapsed:%0.3f gr=%ld fr=%ld fps:%3.1f   ", el, capinfo.cnt, fr, fr/t);
+		printf("\relapsed:%0.3f gr=%ld gps:%3.1f br=%ld fr=%ld fps:%3.1f   ",
+			el, pcap->cnt, pcap->cnt/t, pbkg!=NULL ? pbkg->cnt : 0, fr, fr/t);
 		fflush(stdout);
 		if (debug > 1) {
 			cv::imshow("Deepseg:output",raw);
 			if (cv::waitKey(1) == 'q') break;
 		}
 	}
-	pthread_mutex_lock(&capinfo.lock);
-	capinfo.grab = NULL;
-	pthread_mutex_unlock(&capinfo.lock);
+	capture_stop(pcap);
+	if (pbkg!=NULL)
+		capture_stop(pbkg);
 
 	return 0;
 }

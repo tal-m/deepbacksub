@@ -23,7 +23,7 @@ else
     $(error Couldn't find OpenCV)
 endif
 
-deepseg: deepseg.cc loopback.cc
+deepseg: deepseg.cc loopback.cc capture.cc
 	g++ $^ ${CFLAGS} ${LDFLAGS} -o $@
 
 all: deepseg
