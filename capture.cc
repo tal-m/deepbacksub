@@ -13,13 +13,17 @@ static void *grab_thread(void *arg) {
 	while (!done) {
 		bool ok = ci->cap->grab();
 		pthread_mutex_lock(&ci->lock);
-		if (ci->grab!=NULL)
-			ok = ok ? ci->cap->retrieve(*ci->grab) : ok;
-		else
-			done = true;
 		ci->cnt++;
+		if (ci->grab!=NULL) {
+			if (ok)
+				ok = ci->cap->retrieve(*(ci->grab));
+			if (ok && ci->callback!=NULL)
+				ok = ci->callback(ci->grab, ci->cb_ctx);
+		} else {
+			done = true;
+		}
 		pthread_mutex_unlock(&ci->lock);
-		// if we had grab or retrieve failure, try looping
+		// if we had grab, retrieve or callback failure, try looping
 		if (!ok) {
 			ci->cap->set(CV_CAP_PROP_POS_FRAMES, 0);
 			ci->cnt = 0;
@@ -43,20 +47,22 @@ capinfo_t *capture_init(const char *device, int *w, int *h, int debug) {
 	pcap->raw = new cv::Mat;
 	pcap->cnt = 0;
 	pcap->lock = PTHREAD_MUTEX_INITIALIZER;
+	pcap->callback = NULL;
+	pcap->cb_ctx = NULL;
 	// check for local device name and ensure using V4L2, set capture props,
 	// otherwise assume URL and allow OpenCV to choose the right backend,
 	// finally, always enable RGB (actually BGR24) conversion so we have sane input
 	// https://github.com/opencv/opencv/blob/master/modules/videoio/src/cap_v4l.cpp#1525
 	if (strncmp(device, "/dev/video", 10)==0) {
 		pcap->cap->open(device, CV_CAP_V4L2);
-		pcap->cap->set(CV_CAP_PROP_FRAME_WIDTH,  *w);
-		pcap->cap->set(CV_CAP_PROP_FRAME_HEIGHT, *h);
+		pcap->cap->set(CV_CAP_PROP_FRAME_WIDTH,  pcap->w=*w);
+		pcap->cap->set(CV_CAP_PROP_FRAME_HEIGHT, pcap->h=*h);
 		pcap->cap->set(CV_CAP_PROP_CONVERT_RGB, true);
 	} else {
 		pcap->cap->open(device);
 		pcap->cap->set(CV_CAP_PROP_CONVERT_RGB, true);
-		*w=(int)pcap->cap->get(CV_CAP_PROP_FRAME_WIDTH);
-		*h=(int)pcap->cap->get(CV_CAP_PROP_FRAME_HEIGHT);
+		pcap->w=*w=(int)pcap->cap->get(CV_CAP_PROP_FRAME_WIDTH);
+		pcap->h=*h=(int)pcap->cap->get(CV_CAP_PROP_FRAME_HEIGHT);
 	}
 	pcap->rate=(int)pcap->cap->get(CV_CAP_PROP_FPS);
 	if (pcap->rate<0)
@@ -80,6 +86,13 @@ cv::Mat *capture_frame(capinfo_t *pcap) {
 	pcap->raw = t;
 	pthread_mutex_unlock(&pcap->lock);
 	return pcap->raw;
+}
+
+void capture_setcb(capinfo_t *pcap, bool (*cb)(cv::Mat *, void *), void *ctx) {
+	pthread_mutex_lock(&pcap->lock);
+	pcap->callback = cb;
+	pcap->cb_ctx = ctx;
+	pthread_mutex_unlock(&pcap->lock);
 }
 
 void capture_stop(capinfo_t *pcap) {

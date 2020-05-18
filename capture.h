@@ -14,11 +14,14 @@ typedef struct {
 	pthread_mutex_t lock;
 	pthread_t tid;
 	struct timespec last;
-	int rate;
+	int w, h, rate;
+	bool (*callback)(cv::Mat *raw, void *ctx);
+	void *cb_ctx;
 } capinfo_t;
 
 capinfo_t *capture_init(const char* device, int *w, int *h, int debug);
 cv::Mat *capture_frame(capinfo_t *pcap);
+void capture_setcb(capinfo_t *pcap, bool (*cb)(cv::Mat *, void *), void *ctx);
 void capture_stop(capinfo_t *pcap);
 
 #endif // _CAPTURE_H_

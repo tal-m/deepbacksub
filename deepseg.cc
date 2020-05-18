@@ -14,21 +14,12 @@ limitations under the License.
 
 #include <unistd.h>
 #include <cstdio>
-#include "tensorflow/lite/interpreter.h"
-#include "tensorflow/lite/kernels/register.h"
-#include "tensorflow/lite/model.h"
-#include "tensorflow/lite/optional_debug_tools.h"
 
-#include <opencv2/core/core.hpp>
-#include <opencv2/imgproc/imgproc.hpp>
-#include <opencv2/highgui/highgui.hpp>
-#include <opencv2/imgproc/types_c.h>
+#include <opencv2/opencv.hpp>
 
 #include "loopback.h"
 #include "capture.h"
-
-// Tensorflow Lite helper functions
-using namespace tflite;
+#include "inference.h"
 
 #define TFLITE_MINIMAL_CHECK(x)                              \
   if (!(x)) {                                                \
@@ -36,29 +27,78 @@ using namespace tflite;
 	exit(1);                                                 \
   }
 
-std::unique_ptr<Interpreter> interpreter;
-
-cv::Mat getTensorMat(int tnum, int debug) {
-
-	TfLiteType t_type = interpreter->tensor(tnum)->type;
-	TFLITE_MINIMAL_CHECK(t_type == kTfLiteFloat32);
-
-	TfLiteIntArray* dims = interpreter->tensor(tnum)->dims;
-	if (debug) for (int i = 0; i < dims->size; i++) printf("tensor #%d: %d\n",tnum,dims->data[i]);
-	TFLITE_MINIMAL_CHECK(dims->data[0] == 1);
-	
-	int h = dims->data[1];
-	int w = dims->data[2];
-	int c = dims->data[3];
-
-	float* p_data = interpreter->typed_tensor<float>(tnum);
-	TFLITE_MINIMAL_CHECK(p_data != nullptr);
-
-	return cv::Mat(h,w,CV_32FC(c),p_data);
-}
-
 // deeplabv3 classes
 std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
+
+typedef struct {
+	capinfo_t *pcap;
+	capinfo_t *pbkg;
+	cv::Mat bg;
+	cv::Mat mask;
+	int lbfd;
+	int outw, outh;
+	int debug;
+	bool done;
+} frame_ctx_t;
+
+// Process an incoming raw video frame
+bool process_frame(cv::Mat *raw, void *ctx) {
+	frame_ctx_t *pfr = (frame_ctx_t *)ctx;
+	// grab next available background frame (if video)
+	if (pfr->pbkg!=NULL) {
+		pfr->bg = *(capture_frame(pfr->pbkg));
+		// resize to output if required
+		if (pfr->pbkg->w != pfr->pcap->w || pfr->pbkg->h != pfr->pcap->h)
+			cv::resize(pfr->bg,pfr->bg,cv::Size(pfr->pcap->w,pfr->pcap->h));
+	}
+	// otherwise assume pfr->bg is a suitable static image..
+
+	// resize if required
+	if (pfr->pcap->w != pfr->outw || pfr->pcap->h != pfr->outh)
+		cv::resize(*raw,*raw,cv::Size(pfr->outw,pfr->outh));
+
+	// alpha blend raw and background images using mask, adapted from:
+	// https://www.learnopencv.com/alpha-blending-using-opencv-cpp-python/
+	uint8_t *rptr = (uint8_t*)raw->data;
+	uint8_t *bptr = (uint8_t*)pfr->bg.data;
+	float   *aptr = (float*)pfr->mask.data;
+	int npix = raw->rows * raw->cols;
+	cv::Mat out = cv::Mat::zeros(raw->size(), raw->type());;
+	uint8_t *optr = (uint8_t*)out.data;
+	for (int pix=0; pix<npix; ++pix) {
+		// blending weights
+		float rw=*aptr, bw=1.0-rw;
+		// blend each channel byte
+		*optr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr; ++optr;
+		*optr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr; ++optr;
+		*optr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr; ++optr;
+		++aptr;
+	}
+
+	// write frame to v4l2loopback
+	cv::Mat yuv;
+	cv::cvtColor(out,yuv,CV_BGR2YUV_I420);
+	int framesize = yuv.step[0]*yuv.rows;
+	int ret = write(pfr->lbfd,yuv.data,framesize);
+	if (ret != framesize)
+		return false;
+
+	char ti[64];
+	if (pfr->debug > 2) {
+		sprintf(ti, "raw: %dx%d/%d", raw->cols, raw->rows, raw->type());
+		cv::imshow(ti,*raw);
+		sprintf(ti, "bg: %dx%d/%d", pfr->bg.cols, pfr->bg.rows, pfr->bg.type());
+		cv::imshow(ti,pfr->bg);
+		sprintf(ti, "mask: %dx%d/%d", pfr->mask.cols, pfr->mask.rows, pfr->mask.type());
+		cv::imshow(ti,pfr->mask);
+	}
+	if (pfr->debug > 1) {
+		sprintf(ti, "out: %dx%d/%d", out.cols, out.rows, out.type());
+		cv::imshow(ti,out);
+		if (cv::waitKey(1) == 'q') pfr->done = true;
+	}
+	return true;
+}
 
 int main(int argc, char* argv[]) {
 
@@ -104,19 +144,22 @@ int main(int argc, char* argv[]) {
 	printf("back:   %s\n", back);
 	printf("threads:%d\n", threads);
 
+	// context data shared with callback
+	frame_ctx_t fctx;
+	fctx.done = false;
+	fctx.debug = debug;
+	fctx.outw = width;
+	fctx.outh = height;
 	// open loopback virtual camera stream, always with YUV420p output
-	int lbfd = loopback_init(vcam,width,height,debug);
+	fctx.lbfd = loopback_init(vcam,width,height,debug);
 	// open capture device stream, pass in/out expected/actual size
 	int capw = width, caph = height;
-	capinfo_t *pcap = capture_init(ccam, &capw, &caph, debug);
-	TFLITE_MINIMAL_CHECK(pcap!=NULL);
-	printf("stream info:\n");
-	printf("  width:  %d\n", capw);
-	printf("  height: %d\n", caph);
-	printf("  rate:   %d\n", pcap->rate);
+	fctx.pcap = capture_init(ccam, &capw, &caph, debug);
+	TFLITE_MINIMAL_CHECK(fctx.pcap!=NULL);
+	printf("stream info: %dx%d @ %dfps\n", capw, caph, fctx.pcap->rate);
+
 	// check background file extension (yeah, I know) to spot videos..
-	cv::Mat bg;
-	capinfo_t *pbkg = NULL;
+	fctx.pbkg = NULL;
 	int bkgw = width, bkgh = height;
 	char *dot = rindex((char*)back, '.');
 	if (dot!=NULL &&
@@ -124,35 +167,28 @@ int main(int argc, char* argv[]) {
 		 strcasecmp(dot, ".jpg")==0 ||
 		 strcasecmp(dot, ".jpeg")==0)) {
 		// read background into raw BGR24 format, resize to output
-		bg = cv::imread(back);
-		cv::resize(bg,bg,cv::Size(width,height));
+		fctx.bg = cv::imread(back);
+		cv::resize(fctx.bg,fctx.bg,cv::Size(width,height));
 	} else {
-		// assume video background..
-		pbkg = capture_init(back, &bkgw, &bkgh, debug);
-		TFLITE_MINIMAL_CHECK(pbkg!=NULL);
+		// assume video background..start capture
+		fctx.pbkg = capture_init(back, &bkgw, &bkgh, debug);
+		TFLITE_MINIMAL_CHECK(fctx.pbkg!=NULL);
 	}
 
 	// Load model
-	std::unique_ptr<tflite::FlatBufferModel> model =
-		tflite::FlatBufferModel::BuildFromFile(modelname);
-	TFLITE_MINIMAL_CHECK(model != nullptr);
+	tfinfo_t *ptf = tf_init(modelname, threads, debug);
 
-	// Build the interpreter
-	tflite::ops::builtin::BuiltinOpResolver resolver;
-	InterpreterBuilder builder(*model, resolver);
-	builder(&interpreter);
-	TFLITE_MINIMAL_CHECK(interpreter != nullptr);
-
-	// Allocate tensor buffers.
-	TFLITE_MINIMAL_CHECK(interpreter->AllocateTensors() == kTfLiteOk);
-
-	// set interpreter params
-	interpreter->SetNumThreads(threads);
-	interpreter->SetAllowFp16PrecisionForFp32(true);
-
-	// get input and output tensor as cv::Mat
-	cv::Mat  input = getTensorMat(interpreter->inputs ()[0],debug);
- 	cv::Mat output = getTensorMat(interpreter->outputs()[0],debug);
+	// wrap input and output tensor with cv::Mat
+	cv::Mat  input = cv::Mat(
+		ptf->buffers[TFINFO_BUF_IN].h,
+		ptf->buffers[TFINFO_BUF_IN].w,
+		CV_32FC(ptf->buffers[TFINFO_BUF_IN].c),
+		ptf->buffers[TFINFO_BUF_IN].data);
+	cv::Mat output = cv::Mat(
+		ptf->buffers[TFINFO_BUF_OUT].h,
+		ptf->buffers[TFINFO_BUF_OUT].w,
+		CV_32FC(ptf->buffers[TFINFO_BUF_OUT].c),
+		ptf->buffers[TFINFO_BUF_OUT].data);
 	TFLITE_MINIMAL_CHECK( input.rows ==  input.cols);
 	TFLITE_MINIMAL_CHECK(output.rows == output.cols);
 
@@ -160,6 +196,7 @@ int main(int argc, char* argv[]) {
 	cv::Rect roidim = cv::Rect((width-height)/2,0,height,height);
 	cv::Mat mask = cv::Mat::zeros(height,width,CV_32FC1);
 	cv::Mat mroi = mask(roidim);
+	mask.copyTo(fctx.mask);
 
 	// erosion/dilation elements
 	cv::Mat element3 = cv::getStructuringElement( cv::MORPH_ELLIPSE, cv::Size(3,3) );
@@ -169,22 +206,17 @@ int main(int argc, char* argv[]) {
 	const int cnum = labels.size();
 	const int pers = std::find(labels.begin(),labels.end(),"person") - labels.begin();
 
+	// attach input frame callback
+	capture_setcb(fctx.pcap, process_frame, &fctx);
+
 	// stats
 	int64 es = cv::getTickCount();
 	int64 e1 = es;
 	int64 fr = 0;
-	while (true) {
-
-		// grab next available background frame (if video)
-		if (pbkg!=NULL) {
-			bg = *(capture_frame(pbkg));
-			// resize to output if required
-			if (bkgw != width || bkgh != height)
-				cv::resize(bg,bg,cv::Size(width,height));
-		}
+	while (!fctx.done) {
 
 		// grab next available video frame
-		cv::Mat raw = *(capture_frame(pcap));
+		cv::Mat raw = *(capture_frame(fctx.pcap));
 		// resize to output if required
 		if (capw != width || caph != height)
 			cv::resize(raw,raw,cv::Size(width,height));
@@ -201,7 +233,7 @@ int main(int argc, char* argv[]) {
 		in_resized.convertTo(input,CV_32FC3,1.0/128.0,-1.0);
 
 		// Run inference
-		TFLITE_MINIMAL_CHECK(interpreter->Invoke() == kTfLiteOk);
+		TFLITE_MINIMAL_CHECK(tf_infer(ptf));
 
 		// create Mat for small mask
 		cv::Mat ofinal(output.rows,output.cols,CV_32FC1);
@@ -228,35 +260,17 @@ int main(int argc, char* argv[]) {
 			cv::morphologyEx(ofinal,ofinal,CV_MOP_OPEN,element3);
 			cv::morphologyEx(ofinal,ofinal,CV_MOP_CLOSE,element7);
 			cv::morphologyEx(ofinal,ofinal,CV_MOP_OPEN,element7);
-			cv::dilate(ofinal,ofinal,element11);
+			cv::dilate(ofinal,ofinal,element7);
 		}
 		// smooth mask edges
 		if (getenv("DEEPSEG_NOBLUR")==NULL)
 			cv::blur(ofinal,ofinal,cv::Size(7,7));
 		// scale up into full-sized mask
 		cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
-		// alpha blend raw and background images using mask, adapted from:
-		// https://www.learnopencv.com/alpha-blending-using-opencv-cpp-python/
-		uint8_t *rptr = (uint8_t*)raw.data;
-		uint8_t *bptr = (uint8_t*)bg.data;
-		float   *aptr = (float*)mask.data;
-		int npix = raw.rows * raw.cols;
-		for (int pix=0; pix<npix; ++pix) {
-			// blending weights
-			float rw=*aptr, bw=1.0-rw;
-			// blend each channel byte
-			*rptr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr;
-			*rptr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr;
-			*rptr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr;
-			++aptr;
-		}
-
-		// write frame to v4l2loopback
-		cv::Mat yuv;
-		cv::cvtColor(raw,yuv,CV_BGR2YUV_I420);
-		int framesize = yuv.step[0]*yuv.rows;
-		int ret = write(lbfd,yuv.data,framesize);
-		TFLITE_MINIMAL_CHECK(ret == framesize);
+		// copy to render thread
+		pthread_mutex_lock(&fctx.pcap->lock);
+		mask.copyTo(fctx.mask);
+		pthread_mutex_unlock(&fctx.pcap->lock);
 		++fr;
 
 		if (!debug) { printf("."); fflush(stdout); continue; }
@@ -266,16 +280,12 @@ int main(int argc, char* argv[]) {
 		float t = (e2-es)/cv::getTickFrequency();
 		e1 = e2;
 		printf("\relapsed:%0.3f gr=%ld gps:%3.1f br=%ld fr=%ld fps:%3.1f   ",
-			el, pcap->cnt, pcap->cnt/t, pbkg!=NULL ? pbkg->cnt : 0, fr, fr/t);
+			el, fctx.pcap->cnt, fctx.pcap->cnt/t, fctx.pbkg!=NULL ? fctx.pbkg->cnt : 0, fr, fr/t);
 		fflush(stdout);
-		if (debug > 1) {
-			cv::imshow("Deepseg:output",raw);
-			if (cv::waitKey(1) == 'q') break;
-		}
 	}
-	capture_stop(pcap);
-	if (pbkg!=NULL)
-		capture_stop(pbkg);
+	capture_stop(fctx.pcap);
+	if (fctx.pbkg!=NULL)
+		capture_stop(fctx.pbkg);
 
 	return 0;
 }
