@@ -55,15 +55,16 @@ capinfo_t *capture_init(const char *device, int *w, int *h, int debug) {
 	// https://github.com/opencv/opencv/blob/master/modules/videoio/src/cap_v4l.cpp#1525
 	if (strncmp(device, "/dev/video", 10)==0) {
 		pcap->cap->open(device, CV_CAP_V4L2);
-		pcap->cap->set(CV_CAP_PROP_FRAME_WIDTH,  pcap->w=*w);
-		pcap->cap->set(CV_CAP_PROP_FRAME_HEIGHT, pcap->h=*h);
+		pcap->cap->set(CV_CAP_PROP_FRAME_WIDTH,  *w);
+		pcap->cap->set(CV_CAP_PROP_FRAME_HEIGHT, *h);
 		pcap->cap->set(CV_CAP_PROP_CONVERT_RGB, true);
 	} else {
 		pcap->cap->open(device);
 		pcap->cap->set(CV_CAP_PROP_CONVERT_RGB, true);
-		pcap->w=*w=(int)pcap->cap->get(CV_CAP_PROP_FRAME_WIDTH);
-		pcap->h=*h=(int)pcap->cap->get(CV_CAP_PROP_FRAME_HEIGHT);
 	}
+	// always read the actual dimensions & rate back
+	pcap->w=*w=(int)pcap->cap->get(CV_CAP_PROP_FRAME_WIDTH);
+	pcap->h=*h=(int)pcap->cap->get(CV_CAP_PROP_FRAME_HEIGHT);
 	pcap->rate=(int)pcap->cap->get(CV_CAP_PROP_FPS);
 	if (pcap->rate<0)
 		pcap->rate = 30;	// default V4L2 rate (says OpenCV manual)

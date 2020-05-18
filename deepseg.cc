@@ -48,8 +48,8 @@ bool process_frame(cv::Mat *raw, void *ctx) {
 	if (pfr->pbkg!=NULL) {
 		pfr->bg = *(capture_frame(pfr->pbkg));
 		// resize to output if required
-		if (pfr->pbkg->w != pfr->pcap->w || pfr->pbkg->h != pfr->pcap->h)
-			cv::resize(pfr->bg,pfr->bg,cv::Size(pfr->pcap->w,pfr->pcap->h));
+		if (pfr->pbkg->w != pfr->outw || pfr->pbkg->h != pfr->outh)
+			cv::resize(pfr->bg,pfr->bg,cv::Size(pfr->outw,pfr->outh));
 	}
 	// otherwise assume pfr->bg is a suitable static image..
 
