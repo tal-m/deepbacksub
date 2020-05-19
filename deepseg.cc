@@ -179,16 +179,12 @@ int main(int argc, char* argv[]) {
 	tfinfo_t *ptf = tf_init(modelname, threads, debug);
 
 	// wrap input and output tensor with cv::Mat
-	cv::Mat  input = cv::Mat(
-		ptf->buffers[TFINFO_BUF_IN].h,
-		ptf->buffers[TFINFO_BUF_IN].w,
-		CV_32FC(ptf->buffers[TFINFO_BUF_IN].c),
-		ptf->buffers[TFINFO_BUF_IN].data);
-	cv::Mat output = cv::Mat(
-		ptf->buffers[TFINFO_BUF_OUT].h,
-		ptf->buffers[TFINFO_BUF_OUT].w,
-		CV_32FC(ptf->buffers[TFINFO_BUF_OUT].c),
-		ptf->buffers[TFINFO_BUF_OUT].data);
+	tfbuffer_t *tbuf = tf_get_buffer(ptf, TFINFO_BUF_IN);
+	cv::Mat  input = cv::Mat(tbuf->h, tbuf->w, CV_32FC(tbuf->c), tbuf->data);
+	delete tbuf;
+	tbuf = tf_get_buffer(ptf, TFINFO_BUF_OUT);
+	cv::Mat output = cv::Mat(tbuf->h, tbuf->w, CV_32FC(tbuf->c), tbuf->data);
+	delete tbuf;
 	TFLITE_MINIMAL_CHECK( input.rows ==  input.cols);
 	TFLITE_MINIMAL_CHECK(output.rows == output.cols);
 
