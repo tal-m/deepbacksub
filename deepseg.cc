@@ -39,6 +39,7 @@ typedef struct {
 	int outw, outh;
 	int debug;
 	bool done;
+	pthread_mutex_t lock;
 } frame_ctx_t;
 
 // Process an incoming raw video frame
@@ -48,17 +49,18 @@ bool process_frame(cv::Mat *raw, void *ctx) {
 	if (pfr->pbkg!=NULL) {
 		pfr->bg = *(capture_frame(pfr->pbkg));
 		// resize to output if required
-		if (pfr->pbkg->w != pfr->outw || pfr->pbkg->h != pfr->outh)
+		if (pfr->bg.cols != pfr->outw || pfr->bg.rows != pfr->outh)
 			cv::resize(pfr->bg,pfr->bg,cv::Size(pfr->outw,pfr->outh));
 	}
 	// otherwise assume pfr->bg is a suitable static image..
 
 	// resize if required
-	if (pfr->pcap->w != pfr->outw || pfr->pcap->h != pfr->outh)
+	if (raw->cols != pfr->outw || raw->rows != pfr->outh)
 		cv::resize(*raw,*raw,cv::Size(pfr->outw,pfr->outh));
 
 	// alpha blend raw and background images using mask, adapted from:
 	// https://www.learnopencv.com/alpha-blending-using-opencv-cpp-python/
+	pthread_mutex_lock(&pfr->lock);
 	uint8_t *rptr = (uint8_t*)raw->data;
 	uint8_t *bptr = (uint8_t*)pfr->bg.data;
 	float   *aptr = (float*)pfr->mask.data;
@@ -74,6 +76,7 @@ bool process_frame(cv::Mat *raw, void *ctx) {
 		*optr = (uint8_t)( (float)(*rptr)*rw + (float)(*bptr)*bw ); ++rptr; ++bptr; ++optr;
 		++aptr;
 	}
+	pthread_mutex_unlock(&pfr->lock);
 
 	// write frame to v4l2loopback
 	cv::Mat yuv;
@@ -146,6 +149,7 @@ int main(int argc, char* argv[]) {
 
 	// context data shared with callback
 	frame_ctx_t fctx;
+	fctx.lock = PTHREAD_MUTEX_INITIALIZER;
 	fctx.done = false;
 	fctx.debug = debug;
 	fctx.outw = width;
@@ -153,10 +157,10 @@ int main(int argc, char* argv[]) {
 	// open loopback virtual camera stream, always with YUV420p output
 	fctx.lbfd = loopback_init(vcam,width,height,debug);
 	// open capture device stream, pass in/out expected/actual size
-	int capw = width, caph = height;
-	fctx.pcap = capture_init(ccam, &capw, &caph, debug);
+	int capw = width, caph = height, rate;
+	fctx.pcap = capture_init(ccam, &capw, &caph, &rate, debug);
 	TFLITE_MINIMAL_CHECK(fctx.pcap!=NULL);
-	printf("stream info: %dx%d @ %dfps\n", capw, caph, fctx.pcap->rate);
+	printf("stream info: %dx%d @ %dfps\n", capw, caph, rate);
 
 	// check background file extension (yeah, I know) to spot videos..
 	fctx.pbkg = NULL;
@@ -171,7 +175,7 @@ int main(int argc, char* argv[]) {
 		cv::resize(fctx.bg,fctx.bg,cv::Size(width,height));
 	} else {
 		// assume video background..start capture
-		fctx.pbkg = capture_init(back, &bkgw, &bkgh, debug);
+		fctx.pbkg = capture_init(back, &bkgw, &bkgh, &rate, debug);
 		TFLITE_MINIMAL_CHECK(fctx.pbkg!=NULL);
 	}
 
@@ -264,9 +268,9 @@ int main(int argc, char* argv[]) {
 		// scale up into full-sized mask
 		cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
 		// copy to render thread
-		pthread_mutex_lock(&fctx.pcap->lock);
+		pthread_mutex_lock(&fctx.lock);
 		mask.copyTo(fctx.mask);
-		pthread_mutex_unlock(&fctx.pcap->lock);
+		pthread_mutex_unlock(&fctx.lock);
 		++fr;
 
 		if (!debug) { printf("."); fflush(stdout); continue; }
@@ -275,8 +279,10 @@ int main(int argc, char* argv[]) {
 		float el = (e2-e1)/cv::getTickFrequency();
 		float t = (e2-es)/cv::getTickFrequency();
 		e1 = e2;
+		int64 rcnt = capture_count(fctx.pcap);
+		int64 bcnt = fctx.pbkg!=NULL ? capture_count(fctx.pbkg) : 0;
 		printf("\relapsed:%0.3f gr=%ld gps:%3.1f br=%ld fr=%ld fps:%3.1f   ",
-			el, fctx.pcap->cnt, fctx.pcap->cnt/t, fctx.pbkg!=NULL ? fctx.pbkg->cnt : 0, fr, fr/t);
+			el, rcnt, rcnt/t, bcnt, fr, fr/t);
 		fflush(stdout);
 	}
 	capture_stop(fctx.pcap);

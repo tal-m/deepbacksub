@@ -1,9 +1,27 @@
 // OpenCV video capture thread wrapper
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include <pthread.h>
+
+#include <opencv2/videoio.hpp>
+#include <opencv2/videoio/videoio_c.h>	// for various macro values
 
 #include "capture.h"
-#include <opencv2/videoio/videoio_c.h>	// for various macro values
+
+// threaded capture state
+struct _capinfo_t {
+	cv::VideoCapture *cap;
+	cv::Mat *grab;
+	cv::Mat *raw;
+	int64 cnt;
+	pthread_mutex_t lock;
+	pthread_t tid;
+	struct timespec last;
+	int w, h, rate;
+	bool (*callback)(cv::Mat *, void *);
+	void *cb_ctx;
+};
 
 // capture thread function
 static void *grab_thread(void *arg) {
@@ -39,7 +57,7 @@ static void *grab_thread(void *arg) {
 	return NULL;
 }
 
-capinfo_t *capture_init(const char *device, int *w, int *h, int debug) {
+capinfo_t *capture_init(const char *device, int *w, int *h, int *r, int debug) {
 	// allocate capture info and contents
 	capinfo_t *pcap = new capinfo_t;
 	pcap->cap = new cv::VideoCapture;
@@ -65,9 +83,9 @@ capinfo_t *capture_init(const char *device, int *w, int *h, int debug) {
 	// always read the actual dimensions & rate back
 	pcap->w=*w=(int)pcap->cap->get(CV_CAP_PROP_FRAME_WIDTH);
 	pcap->h=*h=(int)pcap->cap->get(CV_CAP_PROP_FRAME_HEIGHT);
-	pcap->rate=(int)pcap->cap->get(CV_CAP_PROP_FPS);
+	pcap->rate=*r=(int)pcap->cap->get(CV_CAP_PROP_FPS);
 	if (pcap->rate<0)
-		pcap->rate = 30;	// default V4L2 rate (says OpenCV manual)
+		pcap->rate=*r=30;	// default V4L2 rate (says OpenCV manual)
 	clock_gettime(CLOCK_MONOTONIC, &pcap->last);
 	// kick off separate grabber thread to keep OpenCV/FFMpeg happy (or it lags badly)
 	if (pthread_create(&pcap->tid, NULL, grab_thread, pcap)) {
@@ -77,16 +95,22 @@ capinfo_t *capture_init(const char *device, int *w, int *h, int debug) {
 }
 
 cv::Mat *capture_frame(capinfo_t *pcap) {
-	// wait for first 2x frames
-	while (pcap->cnt<2)
-		usleep(1000);
-	// switch buffer pointers in capture thread under lock
+	// wait for valid frame
+	while (NULL==pcap->grab->data) {
+		struct timespec ts = { 0, 1000000 }; // 1ms
+		clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+	}
+	// switch buffer pointers in capture state under lock
 	pthread_mutex_lock(&pcap->lock);
 	cv::Mat *t = pcap->grab;
 	pcap->grab = pcap->raw;
 	pcap->raw = t;
 	pthread_mutex_unlock(&pcap->lock);
 	return pcap->raw;
+}
+
+int64 capture_count(capinfo_t *pcap) {
+	return pcap->cnt;
 }
 
 void capture_setcb(capinfo_t *pcap, bool (*cb)(cv::Mat *, void *), void *ctx) {
