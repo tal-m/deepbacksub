@@ -5,7 +5,7 @@
 ![Screenshots with my stupid grinning face](screenshot.jpg)
 (Credits for the nice backgrounds to [Mary Sabell](https://dribbble.com/shots/4686178-Bauhaus-Poster) and [PhotoFunia](https://photofunia.com/effects/retro-wave))
 
-In these modern times where everyone is sitting at home and skype-ing/zoom-ing/webrtc-ing all the time, I was a bit annoyed about always showing my messy home office to the world. Skype has a "blur background" feature, but that starts to get boring after a while (and it's less private than I would personally like). Zoom has some background substitution thingy built-in, but I'm not touching that software with a bargepole. So I decided to look into how to roll my own implementation without being dependent on any particular video conferencing software to support this.
+In these modern times where everyone is sitting at home and skype-ing/zoom-ing/webrtc-ing all the time, I was a bit annoyed about always showing my messy home office to the world. Skype has a "blur background" feature, but that starts to get boring after a while (and it's less private than I would personally like). Zoom has some background substitution thingy built-in, but I'm not touching that software with a bargepole (and that feature is not available on Linux anyway). So I decided to look into how to roll my own implementation without being dependent on any particular video conferencing software to support this.
 
 This whole shebang involves three main steps with varying difficulty:
   - find person in video (hard)
@@ -77,12 +77,28 @@ Tested with the following dependencies:
       - run `./tensorflow/lite/tools/make/build_lib.sh`
   
 Tested with the following software:
-  - Firefox 74.0.1 (works)
-  - Skype 8.58.0.93 (works)
-  - guvcview 2.0.5 (works)
+  - Firefox 
+    - 74.0.1 (works)
+    - 76.0.1 (works)
+  - Skype 
+    - 8.58.0.93 (works)
+    - 8.60.0.76 (works)
+  - guvcview 2.0.5 (works with parameter `-c read`)
   - Microsoft Teams 1.3.00.5153 (works)
-  - Chrome 80.0.3987.87 (b0rks, might be an issue with v4l2loopback)
+  - Chrome 81.0.4044.138 (works)
+  - Zoom 5.0.403652.0509 (works - yes, I'm a hypocrite, I tested it with Zoom after all :-)
   
+## Usage
+
+First, load the v4l2loopback module (extra settings needed to make Chrome work):
+```
+sudo modprobe v4l2loopback devices=1 max_buffers=2 exclusive_caps=1 card_label="VirtualCam"
+```
+Then, run deepseg (-d for debug, -c for capture device, -v for virtual device):
+```
+./deepseg -d -c /dev/video0 -v /dev/video1
+```
+
 ## Limitations/Extensions
 
 As usual: pull requests welcome.
