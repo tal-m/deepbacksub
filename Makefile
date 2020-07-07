@@ -8,6 +8,11 @@ TFLITE=$(TFBASE)/tensorflow/lite/tools/make/
 CFLAGS += -I $(TFBASE) -I $(TFLITE)/downloads/absl -I $(TFLITE)/downloads/flatbuffers/include
 LDFLAGS += -L $(TFLITE)/gen/linux_x86_64/lib/ -ltensorflow-lite
 
+# DLib - lord knows why we have to specify full paths to libblas & liblapack..
+# if we try -lblas -llapack, it b0rks with unknown symbols or libraries
+CFLAGS += -std=c++11 -mavx
+LDFLAGS += -ldlib -lX11 /usr/lib/x86_64-linux-gnu/libblas.so.3 /usr/lib/x86_64-linux-gnu/liblapack.so.3
+
 # git clone -b v2.1.0  https://github.com/tensorflow/tensorflow $(TFBASE)
 # cd $(TFBASE)/tensorflow/lite/tools/make
 # ./download_dependencies.sh && ./build_lib.sh
@@ -23,7 +28,7 @@ else
     $(error Couldn't find OpenCV)
 endif
 
-deepseg: deepseg.cc loopback.cc capture.cc inference.cc
+deepseg: deepseg.cc loopback.cc capture.cc inference.cc dlibhog.cc
 	g++ $^ ${CFLAGS} ${LDFLAGS} -o $@
 
 all: deepseg

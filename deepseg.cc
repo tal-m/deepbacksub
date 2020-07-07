@@ -2,7 +2,7 @@
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -13,6 +13,8 @@ limitations under the License.
 // tested against tensorflow lite v2.1.0 (static library)
 
 #include <unistd.h>
+#include <signal.h>
+#include <execinfo.h>
 #include <cstdio>
 
 #include <opencv2/opencv.hpp>
@@ -20,12 +22,23 @@ limitations under the License.
 #include "loopback.h"
 #include "capture.h"
 #include "inference.h"
+#include "dlibhog.h"
 
 #define TFLITE_MINIMAL_CHECK(x)                              \
   if (!(x)) {                                                \
 	fprintf(stderr, "Error at %s:%d\n", __FILE__, __LINE__); \
 	exit(1);                                                 \
   }
+
+// crash dumper
+void trap(int sig) {
+#define MAXOOPS 20
+	void *oops[MAXOOPS];
+	fprintf(stderr, "SIGNAL:%d\n", sig);
+	int n=backtrace(oops, MAXOOPS);
+	backtrace_symbols_fd(oops, n, 2);
+	exit(1);
+}
 
 // deeplabv3 classes
 std::vector<std::string> labels = { "background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "chair", "cow", "dining table", "dog", "horse", "motorbike", "person", "potted plant", "sheep", "sofa", "train", "tv" };
@@ -65,7 +78,7 @@ bool process_frame(cv::Mat *raw, void *ctx) {
 	uint8_t *bptr = (uint8_t*)pfr->bg.data;
 	float   *aptr = (float*)pfr->mask.data;
 	int npix = raw->rows * raw->cols;
-	cv::Mat out = cv::Mat::zeros(raw->size(), raw->type());;
+	cv::Mat out = cv::Mat::zeros(raw->size(), raw->type());
 	uint8_t *optr = (uint8_t*)out.data;
 	for (int pix=0; pix<npix; ++pix) {
 		// blending weights
@@ -109,6 +122,8 @@ int main(int argc, char* argv[]) {
 	printf("(c) 2020 by floe@butterbrot.org\n");
 	printf("https://github.com/floe/deepseg\n");
 
+	signal(SIGSEGV, trap);
+	signal(SIGABRT, trap);
 	int debug  = 0;
 	int threads= 2;
 	int width  = 640;
@@ -117,14 +132,17 @@ int main(int argc, char* argv[]) {
 	const char *vcam = "/dev/video0";
 	const char *ccam = "/dev/video1";
 
+	bool usehog = false;
 	const char* modelname = "deeplabv3_257_mv_gpu.tflite";
 
 	for (int arg=1; arg<argc; arg++) {
 		if (strncmp(argv[arg], "-?", 2)==0) {
-			fprintf(stderr, "usage: deepseg [-?] [-d] [-c <capture:/dev/video1>] [-v <vcam:/dev/video0>] [-w <width:640>] [-h <height:480>] [-t <threads:2>] [-b <background.png>]\n");
+			fprintf(stderr, "usage: deepseg [-?] [-d] [-c <capture:/dev/video1>] [-v <vcam:/dev/video0>] [-w <width:640>] [-h <height:480>] [-t <threads:2>] [-b <background.png>] [-g (use HOG)]\n");
 			exit(0);
 		} else if (strncmp(argv[arg], "-d", 2)==0) {
 			++debug;
+		} else if (strncmp(argv[arg], "-g", 2)==0) {
+			usehog = true;
 		} else if (strncmp(argv[arg], "-v", 2)==0) {
 			vcam = argv[++arg];
 		} else if (strncmp(argv[arg], "-c", 2)==0) {
@@ -146,6 +164,7 @@ int main(int argc, char* argv[]) {
 	printf("height: %d\n", height);
 	printf("back:   %s\n", back);
 	printf("threads:%d\n", threads);
+	printf("usehog: %d\n", usehog);
 
 	// context data shared with callback
 	frame_ctx_t fctx;
@@ -179,18 +198,28 @@ int main(int argc, char* argv[]) {
 		TFLITE_MINIMAL_CHECK(fctx.pbkg!=NULL);
 	}
 
-	// Load model
-	tfinfo_t *ptf = tf_init(modelname, threads, debug);
+	// Are we flowing or hogging?
+	hoginfo_t *phg = NULL;
+	tfinfo_t *ptf = NULL;
+	cv::Mat input;
+	cv::Mat output;
+	if (usehog) {
+		// Load HOG
+		phg = hog_init(debug);
+	} else {
+		// Load TF model
+		ptf = tf_init(modelname, threads, debug);
 
-	// wrap input and output tensor with cv::Mat
-	tfbuffer_t *tbuf = tf_get_buffer(ptf, TFINFO_BUF_IN);
-	cv::Mat  input = cv::Mat(tbuf->h, tbuf->w, CV_32FC(tbuf->c), tbuf->data);
-	delete tbuf;
-	tbuf = tf_get_buffer(ptf, TFINFO_BUF_OUT);
-	cv::Mat output = cv::Mat(tbuf->h, tbuf->w, CV_32FC(tbuf->c), tbuf->data);
-	delete tbuf;
-	TFLITE_MINIMAL_CHECK( input.rows ==  input.cols);
-	TFLITE_MINIMAL_CHECK(output.rows == output.cols);
+		// wrap input and output tensor with cv::Mat
+		tfbuffer_t *tbuf = tf_get_buffer(ptf, TFINFO_BUF_IN);
+		input = cv::Mat(tbuf->h, tbuf->w, CV_32FC(tbuf->c), tbuf->data);
+		delete tbuf;
+		tbuf = tf_get_buffer(ptf, TFINFO_BUF_OUT);
+		output = cv::Mat(tbuf->h, tbuf->w, CV_32FC(tbuf->c), tbuf->data);
+		delete tbuf;
+		TFLITE_MINIMAL_CHECK( input.rows ==  input.cols);
+		TFLITE_MINIMAL_CHECK(output.rows == output.cols);
+	}
 
 	// initialize mask and square ROI in center
 	cv::Rect roidim = cv::Rect((width-height)/2,0,height,height);
@@ -221,52 +250,62 @@ int main(int argc, char* argv[]) {
 		if (capw != width || caph != height)
 			cv::resize(raw,raw,cv::Size(width,height));
 
-		// map ROI
-		cv::Mat roi = raw(roidim);
-		// convert BGR to RGB, resize ROI to input size
-		cv::Mat in_u8_rgb, in_resized;
-		cv::cvtColor(roi,in_u8_rgb,CV_BGR2RGB);
-		// TODO: can convert directly to float?
-		cv::resize(in_u8_rgb,in_resized,cv::Size(input.cols,input.rows));
+		// HOG or TF sir?
+		if (usehog) {
+			// Run HOG to rough mask
+			TFLITE_MINIMAL_CHECK(hog_faces(phg, raw, output));
 
-		// convert to float and normalize values to [-1;1]
-		in_resized.convertTo(input,CV_32FC3,1.0/128.0,-1.0);
+			// smooth mask..
+			if (!output.empty() && getenv("DEEPSEG_NOBLUR")==NULL)
+				cv::blur(output,mask,cv::Size(7,7));
+		} else {
+			// map ROI
+			cv::Mat roi = raw(roidim);
+			// convert BGR to RGB, resize ROI to input size
+			cv::Mat in_u8_rgb, in_resized;
+			cv::cvtColor(roi,in_u8_rgb,CV_BGR2RGB);
+			// TODO: can convert directly to float?
+			cv::resize(in_u8_rgb,in_resized,cv::Size(input.cols,input.rows));
 
-		// Run inference
-		TFLITE_MINIMAL_CHECK(tf_infer(ptf));
+			// convert to float and normalize values to [-1;1]
+			in_resized.convertTo(input,CV_32FC3,1.0/128.0,-1.0);
 
-		// create Mat for small mask
-		cv::Mat ofinal(output.rows,output.cols,CV_32FC1);
-		float* tmp = (float*)output.data;
-		float* out = (float*)ofinal.data;
+			// Run inference
+			TFLITE_MINIMAL_CHECK(tf_infer(ptf));
 
-		// find class with maximum probability
-		for (unsigned int n = 0; n < output.total(); n++) {
-			float maxval = -10000; int maxpos = 0;
-			for (int i = 0; i < cnum; i++) {
-				if (tmp[n*cnum+i] > maxval) {
-					maxval = tmp[n*cnum+i];
-					maxpos = i;
+			// create Mat for small mask
+			cv::Mat ofinal(output.rows,output.cols,CV_32FC1);
+			float* tmp = (float*)output.data;
+			float* out = (float*)ofinal.data;
+
+			// find class with maximum probability
+			for (unsigned int n = 0; n < output.total(); n++) {
+				float maxval = -10000; int maxpos = 0;
+				for (int i = 0; i < cnum; i++) {
+					if (tmp[n*cnum+i] > maxval) {
+						maxval = tmp[n*cnum+i];
+						maxpos = i;
+					}
 				}
+				// set mask to 1.0 where class == person
+				out[n] = (maxpos==pers ? 1.0 : 0);
 			}
-			// set mask to 1.0 where class == person
-			out[n] = (maxpos==pers ? 1.0 : 0);
-		}
 
-		// denoise, close & open with small then large elements, adapted from:
-		// https://stackoverflow.com/questions/42065405/remove-noise-from-threshold-image-opencv-python
-		if (getenv("DEEPSEG_NODENOISE")==NULL) {
-			cv::morphologyEx(ofinal,ofinal,CV_MOP_CLOSE,element3);
-			cv::morphologyEx(ofinal,ofinal,CV_MOP_OPEN,element3);
-			cv::morphologyEx(ofinal,ofinal,CV_MOP_CLOSE,element7);
-			cv::morphologyEx(ofinal,ofinal,CV_MOP_OPEN,element7);
-			cv::dilate(ofinal,ofinal,element7);
+			// denoise, close & open with small then large elements, adapted from:
+			// https://stackoverflow.com/questions/42065405/remove-noise-from-threshold-image-opencv-python
+			if (getenv("DEEPSEG_NODENOISE")==NULL) {
+				cv::morphologyEx(ofinal,ofinal,CV_MOP_CLOSE,element3);
+				cv::morphologyEx(ofinal,ofinal,CV_MOP_OPEN,element3);
+				cv::morphologyEx(ofinal,ofinal,CV_MOP_CLOSE,element7);
+				cv::morphologyEx(ofinal,ofinal,CV_MOP_OPEN,element7);
+				cv::dilate(ofinal,ofinal,element7);
+			}
+			// smooth mask edges
+			if (getenv("DEEPSEG_NOBLUR")==NULL)
+				cv::blur(ofinal,ofinal,cv::Size(7,7));
+			// scale up into full-sized mask
+			cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
 		}
-		// smooth mask edges
-		if (getenv("DEEPSEG_NOBLUR")==NULL)
-			cv::blur(ofinal,ofinal,cv::Size(7,7));
-		// scale up into full-sized mask
-		cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
 		// copy to render thread
 		pthread_mutex_lock(&fctx.lock);
 		mask.copyTo(fctx.mask);
