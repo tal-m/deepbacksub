@@ -13,7 +13,6 @@
 struct _capinfo_t {
 	cv::VideoCapture *cap;
 	cv::Mat *grab;
-	cv::Mat *raw;
 	int64 cnt;
 	pthread_mutex_t lock;
 	pthread_t tid;
@@ -62,7 +61,6 @@ capinfo_t *capture_init(const char *device, int *w, int *h, int *r, int debug) {
 	capinfo_t *pcap = new capinfo_t;
 	pcap->cap = new cv::VideoCapture;
 	pcap->grab = new cv::Mat;
-	pcap->raw = new cv::Mat;
 	pcap->cnt = 0;
 	pcap->lock = PTHREAD_MUTEX_INITIALIZER;
 	pcap->callback = NULL;
@@ -94,19 +92,20 @@ capinfo_t *capture_init(const char *device, int *w, int *h, int *r, int debug) {
 	return pcap;
 }
 
-cv::Mat *capture_frame(capinfo_t *pcap) {
+void capture_frame(capinfo_t *pcap, cv::Mat& out) {
+	// done?
+	if (!pcap->grab)
+		return;
 	// wait for valid frame
-	while (NULL==pcap->grab->data) {
+	while (pcap->grab->empty()) {
 		struct timespec ts = { 0, 1000000 }; // 1ms
 		clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
 	}
-	// switch buffer pointers in capture state under lock
+	// copy buffer out under lock
 	pthread_mutex_lock(&pcap->lock);
-	cv::Mat *t = pcap->grab;
-	pcap->grab = pcap->raw;
-	pcap->raw = t;
+	pcap->grab->copyTo(out);
 	pthread_mutex_unlock(&pcap->lock);
-	return pcap->raw;
+	return;
 }
 
 int64 capture_count(capinfo_t *pcap) {

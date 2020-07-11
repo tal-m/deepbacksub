@@ -56,30 +56,30 @@ typedef struct {
 } frame_ctx_t;
 
 // Process an incoming raw video frame
-bool process_frame(cv::Mat *raw, void *ctx) {
+bool process_frame(cv::Mat *cap, void *ctx) {
 	frame_ctx_t *pfr = (frame_ctx_t *)ctx;
 	// grab next available background frame (if video)
 	if (pfr->pbkg!=NULL) {
-		pfr->bg = *(capture_frame(pfr->pbkg));
+		capture_frame(pfr->pbkg, pfr->bg);
 		// resize to output if required
 		if (pfr->bg.cols != pfr->outw || pfr->bg.rows != pfr->outh)
 			cv::resize(pfr->bg,pfr->bg,cv::Size(pfr->outw,pfr->outh));
 	}
 	// otherwise assume pfr->bg is a suitable static image..
 
-	// resize if required
-	if (raw->cols != pfr->outw || raw->rows != pfr->outh)
-		cv::resize(*raw,*raw,cv::Size(pfr->outw,pfr->outh));
+	// resize capture frame if required
+	if (cap->cols != pfr->outw || cap->rows != pfr->outh)
+		cv::resize(*cap,*cap,cv::Size(pfr->outw,pfr->outh));
 
-	// alpha blend raw and background images using mask, adapted from:
+	// alpha blend cap and background images using mask, adapted from:
 	// https://www.learnopencv.com/alpha-blending-using-opencv-cpp-python/
-	pthread_mutex_lock(&pfr->lock);
-	uint8_t *rptr = (uint8_t*)raw->data;
+	cv::Mat out = cv::Mat::zeros(cap->size(), cap->type());
+	uint8_t *optr = (uint8_t*)out.data;
+	pthread_mutex_lock(&pfr->lock);     // (lock to protect access to mask.data)
+	uint8_t *rptr = (uint8_t*)cap->data;
 	uint8_t *bptr = (uint8_t*)pfr->bg.data;
 	float   *aptr = (float*)pfr->mask.data;
-	int npix = raw->rows * raw->cols;
-	cv::Mat out = cv::Mat::zeros(raw->size(), raw->type());
-	uint8_t *optr = (uint8_t*)out.data;
+	int npix = cap->rows * cap->cols;
 	for (int pix=0; pix<npix; ++pix) {
 		// blending weights
 		float rw=*aptr, bw=1.0-rw;
@@ -101,8 +101,8 @@ bool process_frame(cv::Mat *raw, void *ctx) {
 
 	char ti[64];
 	if (pfr->debug > 2) {
-		sprintf(ti, "raw: %dx%d/%d", raw->cols, raw->rows, raw->type());
-		cv::imshow(ti,*raw);
+		sprintf(ti, "cap: %dx%d/%d", cap->cols, cap->rows, cap->type());
+		cv::imshow(ti,*cap);
 		sprintf(ti, "bg: %dx%d/%d", pfr->bg.cols, pfr->bg.rows, pfr->bg.type());
 		cv::imshow(ti,pfr->bg);
 		sprintf(ti, "mask: %dx%d/%d", pfr->mask.cols, pfr->mask.rows, pfr->mask.type());
@@ -118,9 +118,9 @@ bool process_frame(cv::Mat *raw, void *ctx) {
 
 int main(int argc, char* argv[]) {
 
-	printf("deepseg v0.1.0\n");
-	printf("(c) 2020 by floe@butterbrot.org\n");
-	printf("https://github.com/floe/deepseg\n");
+	printf("deepseg v0.2.0\n");
+	printf("(c) 2020 by floe@butterbrot.org - https://github.com/floe/deepseg\n");
+	printf("(c) 2020 by phil.github@ashbysoft.com - https://github.com/phlash/deepseg\n");
 
 	signal(SIGSEGV, trap);
 	signal(SIGABRT, trap);
@@ -137,7 +137,8 @@ int main(int argc, char* argv[]) {
 
 	for (int arg=1; arg<argc; arg++) {
 		if (strncmp(argv[arg], "-?", 2)==0) {
-			fprintf(stderr, "usage: deepseg [-?] [-d] [-c <capture:/dev/video1>] [-v <vcam:/dev/video0>] [-w <width:640>] [-h <height:480>] [-t <threads:2>] [-b <background.png>] [-g (use HOG)]\n");
+			fprintf(stderr, "usage: deepseg [-?] [-d] [-c <capture:/dev/video1>] [-v <vcam:/dev/video0>] [-w <width:640>] [-h <height:480>]\n"
+							"[-t <tensorflow threads:2>] [-b <background.png>] [-g (use dlib hoG, not tensorflow)]\n");
 			exit(0);
 		} else if (strncmp(argv[arg], "-d", 2)==0) {
 			++debug;
@@ -244,23 +245,25 @@ int main(int argc, char* argv[]) {
 	int64 fr = 0;
 	while (!fctx.done) {
 
-		// grab next available video frame
-		cv::Mat raw = *(capture_frame(fctx.pcap));
-		// resize to output if required
-		if (capw != width || caph != height)
-			cv::resize(raw,raw,cv::Size(width,height));
+		// grab last captured frame
+		cv::Mat cap;
+		capture_frame(fctx.pcap, cap);
 
 		// HOG or TF sir?
 		if (usehog) {
+			// Resize to output if required
+			if (cap.cols != fctx.outw || cap.rows != fctx.outh)
+				cv::resize(cap,cap,cv::Size(fctx.outw,fctx.outh));
+
 			// Run HOG to rough mask
-			TFLITE_MINIMAL_CHECK(hog_faces(phg, raw, output));
+			TFLITE_MINIMAL_CHECK(hog_faces(phg, cap, output));
 
 			// smooth mask..
 			if (!output.empty() && getenv("DEEPSEG_NOBLUR")==NULL)
 				cv::blur(output,mask,cv::Size(7,7));
 		} else {
 			// map ROI
-			cv::Mat roi = raw(roidim);
+			cv::Mat roi = cap(roidim);
 			// convert BGR to RGB, resize ROI to input size
 			cv::Mat in_u8_rgb, in_resized;
 			cv::cvtColor(roi,in_u8_rgb,CV_BGR2RGB);
@@ -306,7 +309,7 @@ int main(int argc, char* argv[]) {
 			// scale up into full-sized mask
 			cv::resize(ofinal,mroi,cv::Size(mroi.cols,mroi.rows));
 		}
-		// copy to render thread
+		// update mask for render thread (under lock)
 		pthread_mutex_lock(&fctx.lock);
 		mask.copyTo(fctx.mask);
 		pthread_mutex_unlock(&fctx.lock);
