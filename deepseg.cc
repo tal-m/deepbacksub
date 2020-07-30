@@ -95,9 +95,12 @@ bool process_frame(cv::Mat *cap, void *ctx) {
 	cv::Mat yuv;
 	cv::cvtColor(out,yuv,CV_BGR2YUV_I420);
 	int framesize = yuv.step[0]*yuv.rows;
-	int ret = write(pfr->lbfd,yuv.data,framesize);
-	if (ret != framesize)
-		return false;
+	while (framesize > 0) {
+		int ret = write(pfr->lbfd,yuv.data,framesize);
+		if (ret <= 0)
+			return false;
+		framesize -= ret;
+	}
 
 	char ti[64];
 	if (pfr->debug > 2) {
@@ -138,7 +141,7 @@ int main(int argc, char* argv[]) {
 	for (int arg=1; arg<argc; arg++) {
 		if (strncmp(argv[arg], "-?", 2)==0) {
 			fprintf(stderr, "usage: deepseg [-?] [-d] [-c <capture:/dev/video1>] [-v <vcam:/dev/video0>] [-w <width:640>] [-h <height:480>]\n"
-							"[-t <tensorflow threads:2>] [-b <background.png>] [-g (use dlib hoG, not tensorflow)]\n");
+							"[-t <tensorflow threads:2>] -m <tf model file>] [-b <background.png>] [-g (use dlib hoG, not tensorflow)]\n");
 			exit(0);
 		} else if (strncmp(argv[arg], "-d", 2)==0) {
 			++debug;
@@ -150,6 +153,8 @@ int main(int argc, char* argv[]) {
 			ccam = argv[++arg];
 		} else if (strncmp(argv[arg], "-b", 2)==0) {
 			back = argv[++arg];
+		} else if (strncmp(argv[arg], "-m", 2)==0) {
+			modelname = argv[++arg];
 		} else if (strncmp(argv[arg], "-w", 2)==0) {
 			sscanf(argv[++arg], "%d", &width);
 		} else if (strncmp(argv[arg], "-h", 2)==0) {
@@ -165,6 +170,7 @@ int main(int argc, char* argv[]) {
 	printf("height: %d\n", height);
 	printf("back:   %s\n", back);
 	printf("threads:%d\n", threads);
+	printf("model:  %s\n", modelname);
 	printf("usehog: %d\n", usehog);
 
 	// context data shared with callback
@@ -282,16 +288,22 @@ int main(int argc, char* argv[]) {
 			float* out = (float*)ofinal.data;
 
 			// find class with maximum probability
-			for (unsigned int n = 0; n < output.total(); n++) {
-				float maxval = -10000; int maxpos = 0;
-				for (int i = 0; i < cnum; i++) {
-					if (tmp[n*cnum+i] > maxval) {
-						maxval = tmp[n*cnum+i];
-						maxpos = i;
+			if (strstr(modelname, "deeplab")) {
+				for (unsigned int n = 0; n < output.total(); n++) {
+					float maxval = -10000; int maxpos = 0;
+					for (int i = 0; i < cnum; i++) {
+						if (tmp[n*cnum+i] > maxval) {
+							maxval = tmp[n*cnum+i];
+							maxpos = i;
+						}
 					}
+					// set mask to 1.0 where class == person
+					out[n] = (maxpos==pers ? 1.0 : 0);
 				}
-				// set mask to 1.0 where class == person
-				out[n] = (maxpos==pers ? 1.0 : 0);
+            } else if (strstr(modelname,"body-pix")) {
+				for (unsigned int n = 0; n < output.total(); n++) {
+					if (tmp[n] < 0.65) out[n] = 0; else out[n] = 1.0;
+				}
 			}
 
 			// denoise, close & open with small then large elements, adapted from:
