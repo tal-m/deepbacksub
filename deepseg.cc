@@ -300,7 +300,7 @@ int main(int argc, char* argv[]) {
 					// set mask to 1.0 where class == person
 					out[n] = (maxpos==pers ? 1.0 : 0);
 				}
-            } else if (strstr(modelname,"body-pix")) {
+   			} else if (strstr(modelname,"body-pix")) {
 				for (unsigned int n = 0; n < output.total(); n++) {
 					if (tmp[n] < 0.65) out[n] = 0; else out[n] = 1.0;
 				}
