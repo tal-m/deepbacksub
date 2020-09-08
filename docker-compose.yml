@@ -1,0 +1,16 @@
+version: '3.7'
+services:
+  deepseg:
+     build: 
+        context: .
+     container_name: deepseg
+     volumes:
+             #        - "/tmp:/tmp"
+        - "${BACKGROUND:-./background.png}:/opt/deepbacksub/background.png"
+     devices:
+        - "/dev/video0:/dev/video0"
+        - "/dev/video10:/dev/video1"
+     command: [ './deepseg',
+                '-c', '/dev/video0',
+                '-v', '/dev/video1' ]
+

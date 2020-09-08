@@ -20,10 +20,10 @@ LDFLAGS += -ldlib -lX11 /usr/lib/x86_64-linux-gnu/libblas.so.3 /usr/lib/x86_64-l
 # OpenCV
 ifeq ($(shell pkg-config --exists opencv; echo $$?), 0)
     CFLAGS += $(shell pkg-config --cflags opencv)
-    LDFLAGS += $(shell pkg-config --libs opencv)
+    LDFLAGS += $(shell pkg-config --libs opencv) -ldl
 else ifeq ($(shell pkg-config --exists opencv4; echo $$?), 0)
     CFLAGS += $(shell pkg-config --cflags opencv4)
-    LDFLAGS += $(shell pkg-config --libs opencv4)
+    LDFLAGS += $(shell pkg-config --libs opencv4) -ldl
 else
     $(error Couldn't find OpenCV)
 endif

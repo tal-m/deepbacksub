@@ -27,7 +27,7 @@ hoginfo_t *hog_init(int debug) {
 
 bool hog_faces(hoginfo_t *phg, cv::Mat& img, cv::Mat& out) {
     // convert to dlib bgr image type
-    dlib::cv_image<dlib::bgr_pixel> bgr(img);
+    dlib::cv_image<dlib::bgr_pixel> bgr(cvIplImage(img));
     // detect faces!
     std::vector<dlib::rectangle> faces = phg->det(bgr);
     if (faces.size()>0) {

@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstdio>
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/tracking/tracker.hpp>
 
 #include "loopback.h"
 #include "capture.h"
